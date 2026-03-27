@@ -1,0 +1,16 @@
+data/raw/
+data/processed/*.rds
+.Rhistory
+.RData
+.Rproj.user
+*.RData
+
+# HTML output (too large for git — share separately)
+*.html
+
+# CONFIDENTIALITY: never commit non-public data
+input_data/
+Book*.csv
+pp12_data*.RData
+*confidential*
+*CONFID*

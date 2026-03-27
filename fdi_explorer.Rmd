@@ -1,0 +1,2207 @@
+---
+title: "EU FDI Explorer"
+subtitle: "Fishing Effort, Landings, Discards & Métier Shift Detection by Area and Species (2013–2024)"
+author: "Eirini Mantzouni, PhD"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+    number_sections: true
+    fig_width: 10
+    fig_height: 6
+    df_print: paged
+    self_contained: true
+---
+
+```{css custom-width, echo=FALSE}
+.main-container { max-width: 95% !important; }
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.align  = "center",
+  out.width  = "100%"
+)
+
+# ---- Load packages -----------------------------------------------------------
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(
+  tidyverse, data.table, dtplyr, janitor,
+  plotly, highcharter, ggiraph, echarts4r,
+  ggplot2, ggpubr, patchwork, viridisLite, scales, ggrepel, paletteer, pals,
+  reactable, DT, crosstalk, htmltools,
+  cluster, vegan
+)
+
+# ---- Source helpers ----------------------------------------------------------
+source("R/helpers.R")
+
+# ---- Load processed data -----------------------------------------------------
+catches  <- readRDS("data/processed/catches_by_area_year_gear_species.rds")
+effort   <- readRDS("data/processed/effort_by_area_year_gear.rds")
+effort_eu <- readRDS("data/processed/effort_eu_by_area_year_gear.rds")
+effort_metier <- readRDS("data/processed/effort_by_country_year_metier.rds")
+conf_diag <- readRDS("data/processed/conf_diagnostics.rds")
+lo_exemptions <- if (file.exists("data/processed/lo_exemptions.rds")) {
+  readRDS("data/processed/lo_exemptions.rds")
+} else NULL
+```
+
+# Introduction & Context {.tabset}
+
+## Scope
+
+*Data source: STECF FDI public dissemination — 2025 data call (EWG 25-10). Downloaded from <https://stecf.ec.europa.eu/data-dissemination/fdi_en>. All data used in this analysis are publicly available. Confidential values marked as 'C' were treated as NA.*
+
+**Research questions:**
+
+1. How do fishing effort and landings compare across EU sea basins, and how have they changed?
+2. Where are discard rates highest — by area, gear, and species?
+3. Have fleet métier compositions shifted over time in response to regulation?
+
+## Policy Context
+
+- **2015–2019**: Landing Obligation phased in
+- **2019**: West Med MAP (Regulation EU 2019/1022) — effort reduction for trawlers
+- **2025**: FMSY targets become legally binding
+
+# Data Overview {.tabset}
+
+```{r data-overview}
+# ---- Summary by area ---------------------------------------------------------
+overview <- catches %>%
+  group_by(area) %>%
+  summarise(
+    records       = sum(n_records),
+    countries     = n_distinct(country),
+    years         = n_distinct(year),
+    gear_types    = n_distinct(gear_type),
+    species       = n_distinct(species),
+    total_land_t  = sum(landings_wt, na.rm = TRUE),
+    total_disc_t  = sum(discards_wt, na.rm = TRUE),
+    pct_c_land    = 100 * sum(n_c_landings) / sum(n_records),
+    pct_c_disc    = 100 * sum(n_c_discards) / sum(n_records),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_land_t))
+
+reactable(
+  overview,
+  columns = list(
+    area          = colDef(name = "Area", minWidth = 200),
+    records       = colDef(name = "Records", format = colFormat(separators = TRUE)),
+    countries     = colDef(name = "Countries"),
+    years         = colDef(name = "Years"),
+    gear_types    = colDef(name = "Gear types"),
+    species       = colDef(name = "Species"),
+    total_land_t  = colDef(name = "Landings (t)", format = colFormat(separators = TRUE, digits = 0)),
+    total_disc_t  = colDef(name = "Discards (t)", format = colFormat(separators = TRUE, digits = 0)),
+    pct_c_land    = colDef(name = "% C (landings)", format = colFormat(digits = 1)),
+    pct_c_disc    = colDef(name = "% C (discards)", format = colFormat(digits = 1))
+  ),
+  striped  = TRUE,
+  compact  = TRUE,
+  fullWidth = TRUE,
+  defaultPageSize = 10
+)
+```
+
+```{r data-overview-effort}
+# ---- Effort overview (EU level — clean, no C gaps) --------------------------
+eff_overview <- effort_eu %>%
+  group_by(area) %>%
+  summarise(
+    records         = sum(n_records),
+    years           = n_distinct(year),
+    gear_types      = n_distinct(gear_type),
+    total_fish_days = sum(total_fishing_days, na.rm = TRUE),
+    total_kw_days   = sum(total_k_w_days_at_sea, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_fish_days))
+
+reactable(
+  eff_overview,
+  columns = list(
+    area            = colDef(name = "Area", minWidth = 200),
+    records         = colDef(name = "Records", format = colFormat(separators = TRUE)),
+    years           = colDef(name = "Years"),
+    gear_types      = colDef(name = "Gear types"),
+    total_fish_days = colDef(name = "Fishing days", format = colFormat(separators = TRUE, digits = 0)),
+    total_kw_days   = colDef(name = "kW-days at sea", format = colFormat(separators = TRUE, digits = 0))
+  ),
+  striped  = TRUE,
+  compact  = TRUE,
+  fullWidth = TRUE
+)
+```
+
+## Confidentiality Diagnostics {.tabset}
+
+Confidential values (`C`) are replaced with `NA` throughout this analysis. They represent data suppressed by Member States to protect commercial confidentiality. Understanding where these gaps are is essential before interpreting any trend.
+
+### By Country
+
+```{r conf-heatmap-country, fig.height=10}
+# ---- Heatmap: % confidential by country × variable --------------------------
+conf_c <- conf_diag$catches %>%
+  group_by(country) %>%
+  summarise(
+    n = sum(n_total),
+    pct_c_landings = 100 * sum(n_c_landings) / sum(n_total),
+    pct_c_value    = 100 * sum(n_c_value)    / sum(n_total),
+    pct_c_discards = 100 * sum(n_c_discards) / sum(n_total),
+    .groups = "drop"
+  )
+
+conf_e <- conf_diag$effort %>%
+  group_by(country) %>%
+  summarise(
+    pct_c_fish_days = 100 * sum(n_c_fish_days) / sum(n_total),
+    pct_c_kw_days   = 100 * sum(n_c_kw_days)   / sum(n_total),
+    .groups = "drop"
+  )
+
+conf_wide <- conf_c %>%
+  left_join(conf_e, by = "country") %>%
+  select(-n) %>%
+  pivot_longer(-country, names_to = "variable", values_to = "pct_c") %>%
+  mutate(
+    variable = recode(variable,
+      pct_c_landings   = "Landings (wt)",
+      pct_c_value      = "Landings (val)",
+      pct_c_discards   = "Discards",
+      pct_c_fish_days  = "Fishing days",
+      pct_c_kw_days    = "kW-days"
+    )
+  )
+
+p_heat <- ggplot(conf_wide, aes(x = variable, y = reorder(country, pct_c),
+                                 fill = pct_c)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = sprintf("%.0f%%", pct_c)),
+            size = 2.8, colour = "grey20") +
+  scale_fill_viridis_c(option = "inferno", direction = -1,
+                        limits = c(0, 100), name = "% Confidential") +
+  labs(title = "Confidentiality Rate by Country and Variable",
+       subtitle = "% of records where value was C (suppressed). Darker = more transparent.",
+       x = NULL, y = NULL) +
+  theme_fdi() +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+p_heat
+```
+
+### By Area
+
+```{r conf-by-area, fig.height=5}
+# ---- Bar chart: % C by area -------------------------------------------------
+conf_area <- conf_diag$catches %>%
+  group_by(area) %>%
+  summarise(
+    pct_c_landings = 100 * sum(n_c_landings) / sum(n_total),
+    pct_c_discards = 100 * sum(n_c_discards) / sum(n_total),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(-area, names_to = "variable", values_to = "pct_c") %>%
+  mutate(variable = recode(variable,
+    pct_c_landings = "Landings",
+    pct_c_discards = "Discards"
+  ))
+
+p_area_c <- ggplot(conf_area, aes(x = reorder(area, -pct_c), y = pct_c,
+                                   fill = variable,
+                                   text = paste0(area, "\n", variable,
+                                                 ": ", round(pct_c, 1), "%"))) +
+  geom_col(position = "dodge", width = 0.7) +
+  scale_fill_manual(values = c("Landings" = "#3C5488", "Discards" = "#E64B35")) +
+  labs(title = "Confidentiality Rate by Area",
+       subtitle = "Is the Mediterranean more or less confidential than the North Sea?",
+       x = NULL, y = "% records confidential (C)", fill = NULL) +
+  theme_fdi() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+ggplotly_clean(p_area_c, tooltip = "text")
+```
+
+### Over Time
+
+```{r conf-over-time, fig.height=5}
+# ---- Line chart: % C trend over time ----------------------------------------
+conf_yr <- conf_diag$catches %>%
+  group_by(year) %>%
+  summarise(
+    pct_c_landings = 100 * sum(n_c_landings) / sum(n_total),
+    pct_c_discards = 100 * sum(n_c_discards) / sum(n_total),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(-year, names_to = "variable", values_to = "pct_c") %>%
+  mutate(variable = recode(variable,
+    pct_c_landings = "Landings",
+    pct_c_discards = "Discards"
+  ))
+
+p_yr_c <- ggplot(conf_yr, aes(x = year, y = pct_c, colour = variable,
+                               text = paste0(year, "\n", variable,
+                                             ": ", round(pct_c, 1), "%"))) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = c("Landings" = "#3C5488", "Discards" = "#E64B35")) +
+  scale_x_continuous(breaks = 2013:2024) +
+  labs(title = "Confidentiality Rate Over Time (2013\u20132024)",
+       subtitle = "Is reporting improving?",
+       x = NULL, y = "% records confidential (C)", colour = NULL) +
+  theme_fdi()
+
+ggplotly_clean(p_yr_c, tooltip = "text")
+```
+
+# EU-Wide Overview by Area {.tabset}
+
+## Effort & Landings by Area
+
+```{r section-3-1-data}
+# ---- Section 3 with area filter (Step 27) ------------------------------------
+eff_area_yr <- effort_eu %>%
+  group_by(area, year) %>%
+  summarise(fishing_days = sum(total_fishing_days, na.rm = TRUE),
+            kw_days      = sum(total_k_w_days_at_sea, na.rm = TRUE),
+            .groups = "drop")
+
+land_area_yr <- catches %>%
+  group_by(area, year) %>%
+  summarise(landings_t = sum(landings_wt, na.rm = TRUE), .groups = "drop")
+
+# Combine for shared filtering
+eff_land <- eff_area_yr %>%
+  left_join(land_area_yr, by = c("area", "year"))
+
+sd_s3 <- SharedData$new(eff_land, group = "section3")
+```
+
+```{r section-3-1, fig.height=10}
+bscols(widths = c(2, 10),
+  list(
+    filter_select("s3_area", "Filter by Area", sd_s3, ~area, multiple = TRUE)
+  ),
+  list(
+    plot_ly(sd_s3, x = ~year, y = ~fishing_days, color = ~area,
+            colors = unname(pal_area),
+            type = "bar",
+            hovertext = ~paste0(area, " (", year, ")\n",
+                           fmt_thousands(fishing_days), " fishing days"),
+            hoverinfo = "text", textposition = "none") %>%
+      layout(title = "Total Fishing Days by Area",
+             barmode = "stack",
+             xaxis = list(title = ""),
+             yaxis = list(title = "Fishing days")) %>%
+      config(displayModeBar = FALSE),
+    plot_ly(sd_s3, x = ~year, y = ~landings_t, color = ~area,
+            colors = unname(pal_area),
+            type = "bar",
+            hovertext = ~paste0(area, " (", year, ")\n",
+                           fmt_thousands(landings_t), " t landings"),
+            hoverinfo = "text", textposition = "none") %>%
+      layout(title = "Total Landings by Area",
+             barmode = "stack",
+             xaxis = list(title = ""),
+             yaxis = list(title = "Landings (tonnes)")) %>%
+      config(displayModeBar = FALSE)
+  )
+)
+```
+
+## Top Species by Area
+
+```{r section-3-2}
+# ---- Top 10 species by area (highcharter drilldown) --------------------------
+top_sp <- catches %>%
+  group_by(area, species) %>%
+  summarise(landings_t = sum(landings_wt, na.rm = TRUE), .groups = "drop") %>%
+  group_by(area) %>%
+  slice_max(landings_t, n = 10) %>%
+  ungroup()
+
+# Level 1: area totals
+area_totals <- top_sp %>%
+  group_by(area) %>%
+  summarise(y = sum(landings_t), .groups = "drop") %>%
+  mutate(name = area, drilldown = area)
+
+# Level 2: species within each area
+drilldown_series <- top_sp %>%
+  group_by(area) %>%
+  group_map(~ {
+    list(
+      id   = .y$area,
+      name = .y$area,
+      data = list_parse2(
+        tibble(name = .x$species, y = .x$landings_t) %>% arrange(desc(y))
+      )
+    )
+  })
+
+highchart() %>%
+  hc_chart(type = "column") %>%
+  hc_title(text = "Top 10 Species Landings by Area (click to drill down)") %>%
+  hc_subtitle(text = "Total landings 2013\u20132024 (tonnes). C values excluded.") %>%
+  hc_xAxis(type = "category") %>%
+  hc_yAxis(title = list(text = "Landings (tonnes)")) %>%
+  hc_add_series(
+    data  = list_parse(area_totals %>% select(name, y, drilldown)),
+    name  = "Area",
+    colorByPoint = TRUE
+  ) %>%
+  hc_drilldown(
+    allowPointDrilldown = TRUE,
+    series = drilldown_series
+  ) %>%
+  hc_tooltip(pointFormat = "<b>{point.name}</b>: {point.y:,.0f} t") %>%
+  hc_plotOptions(column = list(dataLabels = list(enabled = FALSE)))
+```
+
+## Effort Trends by Area
+
+```{r section-3-3, fig.height=7}
+# ---- Effort trends by area (line plots + policy milestones) ------------------
+eff_trend <- effort_eu %>%
+  group_by(area, year) %>%
+  summarise(fishing_days = sum(total_fishing_days, na.rm = TRUE),
+            kw_days      = sum(total_k_w_days_at_sea, na.rm = TRUE),
+            .groups = "drop")
+
+p_trend <- ggplot(eff_trend, aes(x = year, y = fishing_days / 1e6,
+                                  colour = area,
+                                  text = paste0(area, "\n", year,
+                                                "\n", fmt_thousands(fishing_days), " days"))) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_vline(data = policy_milestones %>% filter(year <= 2024),
+             aes(xintercept = year), linetype = "dashed", colour = "grey40", alpha = 0.6) +
+  geom_text(data = policy_milestones %>% filter(year <= 2024),
+            aes(x = year, y = Inf, label = label),
+            inherit.aes = FALSE, vjust = 1.5, hjust = 0.5,
+            size = 3, colour = "grey30") +
+  scale_colour_manual(values = pal_area) +
+  scale_x_continuous(breaks = 2013:2024) +
+  labs(title = "Fishing Effort Trends by Area (2013\u20132024)",
+       subtitle = "EU-level totals. Dashed lines = policy milestones.",
+       x = NULL, y = "Fishing days (millions)", colour = "Area",
+       caption = "Source: STECF FDI 2025 — Effort EU") +
+  theme_fdi()
+
+ggplotly_clean(p_trend, tooltip = "text")
+```
+
+```{r section-3-3b, fig.height=7}
+# ---- kW-days trend (power-weighted effort) -----------------------------------
+p_kw <- ggplot(eff_trend, aes(x = year, y = kw_days / 1e9,
+                               colour = area,
+                               text = paste0(area, "\n", year,
+                                             "\n", fmt_thousands(kw_days), " kW-days"))) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_vline(data = policy_milestones %>% filter(year <= 2024),
+             aes(xintercept = year), linetype = "dashed", colour = "grey40", alpha = 0.6) +
+  scale_colour_manual(values = pal_area) +
+  scale_x_continuous(breaks = 2013:2024) +
+  labs(title = "Power-Weighted Effort (kW-days at sea) by Area",
+       subtitle = "Accounts for vessel engine power, not just days.",
+       x = NULL, y = "kW-days at sea (billions)", colour = "Area",
+       caption = "Source: STECF FDI 2025 — Effort EU") +
+  theme_fdi()
+
+ggplotly_clean(p_kw, tooltip = "text")
+```
+
+# Mediterranean Deep Dive {.tabset}
+
+## Med Effort by Gear Type
+
+```{r section-4-1-data}
+# ---- Filter to Mediterranean -------------------------------------------------
+med_effort_eu <- effort_eu %>% filter(area == "Mediterranean & Black Sea")
+med_effort    <- effort    %>% filter(area == "Mediterranean & Black Sea")
+med_catches   <- catches   %>% filter(area == "Mediterranean & Black Sea")
+
+# Top gears for consistent ordering
+top_gears <- med_effort_eu %>%
+  group_by(gear_type) %>%
+  summarise(fd = sum(total_fishing_days, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(fd)) %>%
+  head(8) %>%
+  pull(gear_type)
+```
+
+```{r section-4-1, fig.height=8}
+# ---- Med effort by gear type (faceted lines) ---------------------------------
+med_gear_yr <- med_effort_eu %>%
+  mutate(gear_grp = if_else(gear_type %in% top_gears, gear_type, "Other")) %>%
+  group_by(gear_grp, year) %>%
+  summarise(fishing_days = sum(total_fishing_days, na.rm = TRUE),
+            kw_days      = sum(total_k_w_days_at_sea, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(gear_grp = factor(gear_grp, levels = c(top_gears, "Other")))
+
+p_med_gear <- ggplot(med_gear_yr, aes(x = year, y = fishing_days / 1e3,
+                                       colour = gear_grp,
+                                       text = paste0(gear_grp, "\n", year,
+                                                     "\n", fmt_thousands(fishing_days), " days"))) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.5) +
+  geom_vline(xintercept = 2019, linetype = "dashed", colour = "grey40", alpha = 0.6) +
+  annotate("text", x = 2019, y = Inf, label = "West Med MAP",
+           vjust = 1.5, size = 3, colour = "grey30") +
+  facet_wrap(~ gear_grp, scales = "free_y", ncol = 2) +
+  scale_colour_manual(values = c(pal_gear, "Other" = "#CCCCCC"), guide = "none") +
+  scale_x_continuous(breaks = seq(2013, 2024, 2)) +
+  labs(title = "Mediterranean Fishing Effort by Gear Type (2013\u20132024)",
+       subtitle = "EU-level totals (Effort EU). OTB trawl effort post-2019 West Med MAP highlighted.",
+       x = NULL, y = "Fishing days (thousands)",
+       caption = "Source: STECF FDI 2025 — Effort EU. Dashed line = West Med MAP (2019).") +
+  theme_fdi()
+
+ggplotly_clean(p_med_gear, tooltip = "text") %>%
+  plotly::layout(height = 700)
+```
+
+## Med Effort by Country
+
+```{r section-4-2-data}
+# ---- Dashboard 1: Med Effort by Country (full crosstalk) ---------------------
+med_country_gear <- med_effort %>%
+  mutate(gear_grp = if_else(gear_type %in% top_gears, gear_type, "Other")) %>%
+  group_by(country, year, gear_grp) %>%
+  summarise(fishing_days = sum(total_fishing_days, na.rm = TRUE),
+            kw_days      = sum(total_k_w_days_at_sea, na.rm = TRUE),
+            n_records    = sum(n_records),
+            .groups = "drop")
+
+# Top Med countries by total effort
+top_countries <- med_country_gear %>%
+  group_by(country) %>%
+  summarise(total_fd = sum(fishing_days, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(total_fd)) %>%
+  head(10) %>%
+  pull(country)
+
+med_dash1 <- med_country_gear %>%
+  filter(country %in% top_countries)
+
+sd_dash1 <- SharedData$new(med_dash1, group = "dash1")
+```
+
+```{r section-4-2-dashboard, fig.height=10}
+bscols(widths = c(2, 10),
+  list(
+    filter_select("d1_country", "Country", sd_dash1, ~country, multiple = TRUE),
+    filter_slider("d1_year", "Year", sd_dash1, ~year, step = 1, width = "100%"),
+    filter_select("d1_gear", "Gear", sd_dash1, ~gear_grp, multiple = TRUE)
+  ),
+  list(
+    # Stacked bar: effort by country × gear
+    plot_ly(sd_dash1, x = ~country, y = ~fishing_days, color = ~gear_grp,
+            type = "bar",
+            hovertext = ~paste0(country, " — ", gear_grp, " (", year, ")",
+                           "\n", fmt_thousands(fishing_days), " days"),
+            hoverinfo = "text", textposition = "none") %>%
+      layout(title = "Med Fishing Days by Country × Gear",
+             barmode = "stack",
+             xaxis = list(title = ""),
+             yaxis = list(title = "Fishing days")) %>%
+      highlight("plotly_click", persistent = TRUE, dynamic = FALSE) %>%
+      config(displayModeBar = FALSE),
+    # Line: effort trend by country (aggregated from same SharedData)
+    plot_ly(sd_dash1, x = ~year, y = ~fishing_days, color = ~country,
+            type = "scatter", mode = "lines+markers",
+            text = ~paste0(country, " — ", gear_grp, " (", year, ")\n",
+                           fmt_thousands(fishing_days), " days"),
+            hoverinfo = "text") %>%
+      layout(title = "Effort Trend by Country × Gear",
+             xaxis = list(title = ""),
+             yaxis = list(title = "Fishing days")) %>%
+      config(displayModeBar = FALSE),
+    # Table: summary by country
+    reactable(
+      med_dash1 %>%
+        group_by(country) %>%
+        summarise(
+          total_fish_days = sum(fishing_days, na.rm = TRUE),
+          total_kw_days   = sum(kw_days, na.rm = TRUE),
+          top_gear        = gear_grp[which.max(fishing_days)],
+          years           = n_distinct(year),
+          .groups = "drop"
+        ) %>%
+        arrange(desc(total_fish_days)),
+      columns = list(
+        country         = colDef(name = "Country", minWidth = 120),
+        total_fish_days = colDef(name = "Fishing days", format = colFormat(separators = TRUE, digits = 0)),
+        total_kw_days   = colDef(name = "kW-days", format = colFormat(separators = TRUE, digits = 0)),
+        top_gear        = colDef(name = "Top gear"),
+        years           = colDef(name = "Years")
+      ),
+      striped = TRUE, compact = TRUE, fullWidth = TRUE, defaultPageSize = 10
+    )
+  )
+)
+```
+
+## Greek Waters Deep Dive
+
+```{r section-4-3, fig.height=8}
+# ---- Greek waters deep dive --------------------------------------------------
+greek_gsas <- c("GSA20", "GSA22", "GSA23")
+
+# Greek effort vs Med average
+gr_eff <- med_effort %>%
+  mutate(who = if_else(country == "Greece", "Greece", "Med average (excl. GR)")) %>%
+  group_by(who, year) %>%
+  summarise(fishing_days = sum(total_fishing_days, na.rm = TRUE),
+            kw_days      = sum(total_k_w_days_at_sea, na.rm = TRUE),
+            .groups = "drop")
+
+# Normalise Med average to per-country (divide by n countries excl GR)
+n_med_countries <- n_distinct(med_effort$country[med_effort$country != "Greece"])
+gr_eff <- gr_eff %>%
+  mutate(fishing_days = if_else(who != "Greece",
+                                 fishing_days / n_med_countries,
+                                 fishing_days))
+
+p_gr_eff <- ggplot(gr_eff, aes(x = year, y = fishing_days / 1e3,
+                                colour = who, linetype = who,
+                                text = paste0(who, "\n", year, "\n",
+                                              fmt_thousands(fishing_days), " days"))) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 2019, linetype = "dashed", colour = "grey40", alpha = 0.6) +
+  scale_colour_manual(values = c("Greece" = "#E64B35", "Med average (excl. GR)" = "#3C5488")) +
+  scale_linetype_manual(values = c("Greece" = "solid", "Med average (excl. GR)" = "dashed")) +
+  scale_x_continuous(breaks = 2013:2024) +
+  labs(title = "Greek Fishing Effort vs Mediterranean Per-Country Average",
+       subtitle = "Effort by-country file. Med average = total excl. Greece / n countries.",
+       x = NULL, y = "Fishing days (thousands)", colour = NULL, linetype = NULL,
+       caption = "Source: STECF FDI 2025 — Effort by country") +
+  theme_fdi()
+
+ggplotly_clean(p_gr_eff, tooltip = "text")
+```
+
+```{r section-4-3b, fig.height=7}
+# ---- Greek effort by gear type -----------------------------------------------
+gr_gear <- med_effort %>%
+  filter(country == "Greece") %>%
+  mutate(gear_grp = if_else(gear_type %in% head(top_gears, 6), gear_type, "Other")) %>%
+  group_by(gear_grp, year) %>%
+  summarise(fishing_days = sum(total_fishing_days, na.rm = TRUE), .groups = "drop")
+
+p_gr_gear <- ggplot(gr_gear, aes(x = year, y = fishing_days / 1e3,
+                                  fill = gear_grp,
+                                  text = paste0(gear_grp, "\n", year, "\n",
+                                                fmt_thousands(fishing_days), " days"))) +
+  geom_col(position = "stack") +
+  scale_fill_manual(values = c(pal_gear, "Other" = "#CCCCCC")) +
+  scale_x_continuous(breaks = 2013:2024) +
+  labs(title = "Greek Fishing Effort by Gear Type",
+       x = NULL, y = "Fishing days (thousands)", fill = "Gear",
+       caption = "Source: STECF FDI 2025 — Effort by country") +
+  theme_fdi()
+
+ggplotly_clean(p_gr_gear, tooltip = "text")
+```
+
+```{r section-4-3c, fig.height=6}
+# ---- Top species landed in Greek waters --------------------------------------
+gr_sp <- med_catches %>%
+  filter(country == "Greece") %>%
+  group_by(species) %>%
+  summarise(landings_t = sum(landings_wt, na.rm = TRUE), .groups = "drop") %>%
+  slice_max(landings_t, n = 15)
+
+p_gr_sp <- ggplot(gr_sp, aes(x = reorder(species, landings_t), y = landings_t / 1e3,
+                               text = paste0(species, "\n",
+                                             fmt_thousands(landings_t), " t"))) +
+  geom_col(fill = "#E64B35") +
+  coord_flip() +
+  labs(title = "Top 15 Species Landed in Greek Waters (2013\u20132024)",
+       x = NULL, y = "Landings (thousand tonnes)",
+       caption = "Source: STECF FDI 2025 — Catches by country. C values excluded.") +
+  theme_fdi()
+
+ggplotly_clean(p_gr_sp, tooltip = "text")
+```
+
+## Med Species Composition
+
+```{r section-4-4, fig.height=7}
+# ---- Top 20 Med species by landings ------------------------------------------
+med_sp_total <- med_catches %>%
+  group_by(species) %>%
+  summarise(landings_t = sum(landings_wt, na.rm = TRUE), .groups = "drop") %>%
+  slice_max(landings_t, n = 20)
+
+p_med_sp <- ggplot(med_sp_total, aes(x = reorder(species, landings_t),
+                                      y = landings_t / 1e3,
+                                      text = paste0(species, "\n",
+                                                    fmt_thousands(landings_t), " t"))) +
+  geom_col(fill = "#E64B35") +
+  coord_flip() +
+  labs(title = "Top 20 Species by Landings in the Mediterranean (2013\u20132024)",
+       x = NULL, y = "Landings (thousand tonnes)",
+       caption = "Source: STECF FDI 2025 — Catches by country. C values excluded.") +
+  theme_fdi()
+
+ggplotly_clean(p_med_sp, tooltip = "text")
+```
+
+```{r section-4-4b, fig.height=7}
+# ---- Species composition trend (stacked area, top 10) ------------------------
+top10_sp <- med_sp_total %>% head(10) %>% pull(species)
+
+med_sp_yr <- med_catches %>%
+  mutate(sp_grp = if_else(species %in% top10_sp, species, "Other")) %>%
+  group_by(sp_grp, year) %>%
+  summarise(landings_t = sum(landings_wt, na.rm = TRUE), .groups = "drop") %>%
+  mutate(sp_grp = factor(sp_grp, levels = c(top10_sp, "Other")))
+
+# Native plotly stacked area (ggplotly can drop geom_area fills)
+sp_colors <- setNames(
+  c(as.character(paletteer_d("pals::glasbey", n = 10)), "#CCCCCC"),
+  c(top10_sp, "Other")
+)
+
+p_comp <- plot_ly()
+for (sp in rev(levels(med_sp_yr$sp_grp))) {
+  d_sp <- med_sp_yr %>% filter(sp_grp == sp) %>% arrange(year)
+  p_comp <- p_comp %>%
+    add_trace(data = d_sp, x = ~year, y = ~(landings_t / 1e3),
+              type = "scatter", mode = "lines", stackgroup = "one",
+              fillcolor = sp_colors[sp],
+              line = list(color = sp_colors[sp], width = 0.5),
+              name = sp,
+              text = ~paste0(sp, "\n", year, "\n", fmt_thousands(landings_t), " t"),
+              hoverinfo = "text")
+}
+p_comp <- p_comp %>%
+  layout(title = list(text = "Mediterranean Species Composition Over Time<br><sub>Top 10 species + Other</sub>"),
+         xaxis = list(title = "", tickvals = 2013:2024),
+         yaxis = list(title = "Landings (thousand tonnes)"),
+         hovermode = "closest") %>%
+  config(displayModeBar = FALSE)
+p_comp
+```
+
+```{r section-4-4c, fig.height=8}
+# ---- Sunburst: sub_region → gear → species -----------------------------------
+sun_data <- med_catches %>%
+  filter(species %in% top10_sp) %>%
+  mutate(gear_grp = if_else(gear_type %in% top_gears, gear_type, "Other")) %>%
+  group_by(sub_region, gear_grp, species) %>%
+  summarise(landings_t = sum(landings_wt, na.rm = TRUE), .groups = "drop") %>%
+  filter(landings_t > 0)
+
+# Build sunburst hierarchy: ids, labels, parents, values
+sun_l3 <- sun_data %>%
+  mutate(
+    ids     = paste(sub_region, gear_grp, species, sep = " - "),
+    labels  = species,
+    parents = paste(sub_region, gear_grp, sep = " - "),
+    values  = landings_t
+  )
+
+sun_l2 <- sun_data %>%
+  group_by(sub_region, gear_grp) %>%
+  summarise(values = sum(landings_t), .groups = "drop") %>%
+  mutate(
+    ids     = paste(sub_region, gear_grp, sep = " - "),
+    labels  = gear_grp,
+    parents = sub_region
+  )
+
+sun_l1 <- sun_data %>%
+  group_by(sub_region) %>%
+  summarise(values = sum(landings_t), .groups = "drop") %>%
+  mutate(
+    ids     = sub_region,
+    labels  = sub_region,
+    parents = ""
+  )
+
+sun_all <- bind_rows(
+  sun_l1 %>% select(ids, labels, parents, values),
+  sun_l2 %>% select(ids, labels, parents, values),
+  sun_l3 %>% select(ids, labels, parents, values)
+)
+
+plot_ly(sun_all,
+        ids     = ~ids,
+        labels  = ~labels,
+        parents = ~parents,
+        values  = ~values,
+        type    = "sunburst",
+        branchvalues = "total",
+        hoverinfo = "label+value+percent parent",
+        textinfo  = "label") %>%
+  layout(title = list(text = "Mediterranean Landings: Sub-region \u2192 Gear \u2192 Species (top 10)"),
+         margin = list(t = 50)) %>%
+  config(displayModeBar = FALSE)
+```
+
+# Discard Analysis {.tabset}
+
+## Discard Ratios
+
+```{r section-5-1-calc}
+# ---- Discard ratio calculation -----------------------------------------------
+# Only compute where BOTH landings and discards are non-NA (non-C)
+disc_data <- catches %>%
+  group_by(area, sub_region, country, year, quarter,
+           fishing_tech, gear_type, species) %>%
+  summarise(
+    landings_wt = sum(landings_wt, na.rm = TRUE),
+    discards_wt = sum(discards_wt, na.rm = TRUE),
+    n_records   = sum(n_records),
+    n_c_land    = sum(n_c_landings),
+    n_c_disc    = sum(n_c_discards),
+    .groups = "drop"
+  ) %>%
+  # Valid discard ratio: only where BOTH columns had real data
+  mutate(
+    has_valid_disc = (n_records - n_c_disc) > 0 & (n_records - n_c_land) > 0,
+    total_catch    = landings_wt + discards_wt,
+    disc_ratio     = ifelse(has_valid_disc & total_catch > 0,
+                            discards_wt / total_catch, NA_real_)
+  )
+```
+
+```{r section-5-1-coverage}
+# ---- Coverage table: valid discard data by area -----------------------------
+coverage <- disc_data %>%
+  group_by(area) %>%
+  summarise(
+    total_records  = sum(n_records),
+    valid_disc     = sum(has_valid_disc),
+    pct_valid      = 100 * valid_disc / n(),
+    total_disc_t   = sum(discards_wt[has_valid_disc], na.rm = TRUE),
+    total_land_t   = sum(landings_wt[has_valid_disc], na.rm = TRUE),
+    overall_ratio  = 100 * total_disc_t / (total_land_t + total_disc_t),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(overall_ratio))
+
+reactable(
+  coverage,
+  columns = list(
+    area          = colDef(name = "Area", minWidth = 200),
+    total_records = colDef(name = "Total records", format = colFormat(separators = TRUE)),
+    valid_disc    = colDef(name = "With valid discards", format = colFormat(separators = TRUE)),
+    pct_valid     = colDef(name = "% coverage", format = colFormat(digits = 1)),
+    total_disc_t  = colDef(name = "Discards (t)", format = colFormat(separators = TRUE, digits = 0)),
+    total_land_t  = colDef(name = "Landings (t)", format = colFormat(separators = TRUE, digits = 0)),
+    overall_ratio = colDef(name = "Overall discard rate %", format = colFormat(digits = 1))
+  ),
+  striped = TRUE, compact = TRUE, fullWidth = TRUE
+)
+```
+
+Discard ratios are computed as: `discards / (landings + discards)`. Only records where **both** landings and discards were non-confidential (`C`) are included. This conservative approach avoids inflating or deflating rates due to missing data.
+
+## Discard Rates by Gear
+
+```{r section-5-2-data}
+# ---- Dashboard 2: Discard Explorer ------------------------------------------
+disc_gear_all <- disc_data %>%
+  filter(has_valid_disc) %>%
+  group_by(area, gear_type, species) %>%
+  summarise(
+    discards_t  = sum(discards_wt, na.rm = TRUE),
+    landings_t  = sum(landings_wt, na.rm = TRUE),
+    disc_rate   = round(100 * discards_t / (landings_t + discards_t), 1),
+    n_valid     = n(),
+    .groups = "drop"
+  ) %>%
+  filter(n_valid >= 5, landings_t + discards_t > 50)
+
+sd_disc <- SharedData$new(disc_gear_all, group = "dash2")
+```
+
+```{r section-5-2, fig.height=10}
+bscols(widths = c(2, 10),
+  list(
+    filter_select("d2_area", "Area", sd_disc, ~area, multiple = FALSE),
+    filter_select("d2_species", "Species", sd_disc, ~species, multiple = TRUE),
+    filter_select("d2_gear", "Gear", sd_disc, ~gear_type, multiple = TRUE)
+  ),
+  list(
+    # Lollipop: discard rate by gear
+    plot_ly(sd_disc, x = ~disc_rate, y = ~gear_type,
+            type = "bar", orientation = "h",
+            marker = list(color = "#E64B35"),
+            hovertext = ~paste0(gear_type, " — ", species, " (", area, ")",
+                           "\nDiscard rate: ", disc_rate, "%",
+                           "\nDiscards: ", scales::comma(discards_t, accuracy = 1), " t"),
+            hoverinfo = "text", textposition = "none",
+            width = 0.1) %>%
+      layout(title = "Discard Rate by Gear × Species",
+             xaxis = list(title = "Discard rate (%)"),
+             yaxis = list(title = "", categoryorder = "total ascending")) %>%
+      highlight("plotly_click", persistent = TRUE, dynamic = FALSE) %>%
+      config(displayModeBar = FALSE),
+    # Linked table
+    reactable(
+      disc_gear_all,
+      groupBy  = "gear_type",
+      columns  = list(
+        area       = colDef(name = "Area", minWidth = 150),
+        gear_type  = colDef(name = "Gear"),
+        species    = colDef(name = "Species"),
+        discards_t = colDef(name = "Discards (t)", aggregate = "sum",
+                            format = colFormat(separators = TRUE, digits = 0)),
+        landings_t = colDef(name = "Landings (t)", aggregate = "sum",
+                            format = colFormat(separators = TRUE, digits = 0)),
+        disc_rate  = colDef(name = "Discard rate %", aggregate = "mean",
+                            format = colFormat(digits = 1)),
+        n_valid    = colDef(name = "Records", aggregate = "sum",
+                            format = colFormat(separators = TRUE))
+      ),
+      searchable = TRUE, striped = TRUE, compact = TRUE,
+      fullWidth = TRUE, defaultPageSize = 15
+    )
+  )
+)
+```
+
+```{r section-5-2b, fig.height=7}
+# ---- Discard rate trend by gear (Med focus) ----------------------------------
+disc_gear_yr <- disc_data %>%
+  filter(has_valid_disc, area == "Mediterranean & Black Sea") %>%
+  mutate(gear_grp = if_else(gear_type %in% top_gears, gear_type, "Other")) %>%
+  group_by(gear_grp, year) %>%
+  summarise(
+    disc_t  = sum(discards_wt, na.rm = TRUE),
+    land_t  = sum(landings_wt, na.rm = TRUE),
+    disc_rate = 100 * disc_t / (land_t + disc_t),
+    .groups = "drop"
+  )
+
+p_disc_trend <- ggplot(disc_gear_yr, aes(x = year, y = disc_rate, colour = gear_grp,
+                                          text = paste0(gear_grp, "\n", year,
+                                                        "\nDiscard rate: ", round(disc_rate, 1), "%"))) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.5) +
+  geom_vline(xintercept = c(2017, 2019), linetype = "dashed", colour = "grey40", alpha = 0.6) +
+  annotate("text", x = 2017, y = Inf, label = "Med LO pilot", vjust = 1.5, size = 2.8, colour = "grey30") +
+  annotate("text", x = 2019, y = Inf, label = "West Med MAP", vjust = 3, size = 2.8, colour = "grey30") +
+  scale_colour_manual(values = c(pal_gear, "Other" = "#CCCCCC")) +
+  scale_x_continuous(breaks = 2013:2024) +
+  labs(title = "Mediterranean Discard Rate Trend by Gear Type",
+       subtitle = "% of total catch discarded. Only records with valid discard data.",
+       x = NULL, y = "Discard rate (%)", colour = "Gear",
+       caption = "Source: STECF FDI 2025. Dashed lines = LO pilot (2017), West Med MAP (2019).") +
+  theme_fdi()
+
+ggplotly_clean(p_disc_trend, tooltip = "text")
+```
+
+## Discard Hotspot Heatmap
+
+```{r section-5-3, fig.height=12, fig.width=10}
+# ---- Heatmap: gear × sub_region, colour = mean discard ratio ----------------
+disc_heatmap <- disc_data %>%
+  filter(has_valid_disc, area == "Mediterranean & Black Sea") %>%
+  group_by(sub_region, gear_type) %>%
+  summarise(
+    disc_t    = sum(discards_wt, na.rm = TRUE),
+    land_t    = sum(landings_wt, na.rm = TRUE),
+    disc_rate = 100 * disc_t / (land_t + disc_t),
+    n_records = sum(n_records),
+    .groups = "drop"
+  ) %>%
+  filter(n_records >= 5, land_t + disc_t > 10) %>%
+  # Keep only gears and sub_regions with enough data
+  group_by(gear_type) %>%
+  filter(n() >= 3) %>%
+  ungroup()
+
+p_hm <- ggplot(disc_heatmap, aes(x = gear_type, y = sub_region, fill = disc_rate,
+                                   text = paste0(sub_region, " × ", gear_type,
+                                                 "\nDiscard rate: ", round(disc_rate, 1), "%",
+                                                 "\nDiscards: ", scales::comma(disc_t, accuracy = 1), " t",
+                                                 "\nRecords: ", scales::comma(n_records)))) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  scale_fill_viridis_c(option = "inferno", direction = -1, limits = c(0, NA),
+                        name = "Discard rate (%)") +
+  labs(title = "Mediterranean Discard Hotspots: Sub-region × Gear Type",
+       subtitle = "Darker = higher discard rate. Only cells with ≥5 records shown.",
+       x = "Gear type", y = "Sub-region",
+       caption = "Source: STECF FDI 2025. C values excluded.") +
+  theme_fdi() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "right")
+
+ggplotly_clean(p_hm, tooltip = "text") %>%
+  plotly::layout(height = 800)
+```
+
+```{r section-5-3-table}
+# ---- Supporting table: top discard hotspots ----------------------------------
+reactable(
+  disc_heatmap %>%
+    arrange(desc(disc_rate)) %>%
+    head(30) %>%
+    mutate(disc_rate = round(disc_rate, 1)),
+  columns = list(
+    sub_region = colDef(name = "Sub-region", minWidth = 100),
+    gear_type  = colDef(name = "Gear"),
+    disc_t     = colDef(name = "Discards (t)", format = colFormat(separators = TRUE, digits = 0)),
+    land_t     = colDef(name = "Landings (t)", format = colFormat(separators = TRUE, digits = 0)),
+    disc_rate  = colDef(name = "Discard rate %"),
+    n_records  = colDef(name = "Records", format = colFormat(separators = TRUE))
+  ),
+  striped = TRUE, compact = TRUE, fullWidth = TRUE, defaultPageSize = 15
+)
+```
+
+## Before/After Landing Obligation {.tabset}
+
+The Landing Obligation was phased in by species group and area (2015–2019). We classify each record as LO-covered or not using the `lo_phases` lookup table in `helpers.R`, then compare discard rates before vs after each species' LO start year.
+
+### LO Impact by Area
+
+```{r section-5-4-lo-flag}
+# ---- Add LO covered flag ----------------------------------------------------
+disc_lo <- disc_data %>%
+  filter(has_valid_disc) %>%
+  mutate(lo_flag = lo_covered(species, area, year))
+```
+
+```{r section-5-4-area, fig.height=7}
+# ---- Before/after LO by area (slope chart) ----------------------------------
+lo_area <- disc_lo %>%
+  mutate(period = case_when(
+    year <= 2014                          ~ "Pre-LO (2013\u20132014)",
+    year >= 2015 & year <= 2018           ~ "Transition (2015\u20132018)",
+    year >= 2019                          ~ "Post-LO (2019\u20132024)"
+  )) %>%
+  filter(!is.na(period), lo_flag) %>%
+  group_by(area, period) %>%
+  summarise(
+    disc_t    = sum(discards_wt, na.rm = TRUE),
+    land_t    = sum(landings_wt, na.rm = TRUE),
+    disc_rate = 100 * disc_t / (land_t + disc_t),
+    .groups = "drop"
+  ) %>%
+  mutate(period = factor(period, levels = c(
+    "Pre-LO (2013\u20132014)", "Transition (2015\u20132018)", "Post-LO (2019\u20132024)"
+  )))
+
+p_lo_area <- ggplot(lo_area, aes(x = period, y = disc_rate, colour = area, group = area,
+                                   text = paste0(area, "\n", period,
+                                                 "\nDiscard rate: ", round(disc_rate, 1), "%"))) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = pal_area) +
+  labs(title = "Discard Rate Before/After Landing Obligation — LO-Covered Species",
+       subtitle = "Only species classified as LO-covered in each period.",
+       x = NULL, y = "Discard rate (%)", colour = "Area",
+       caption = "Periods: Pre-LO (2013–14), Transition (2015–18), Post-LO (2019–24)") +
+  theme_fdi()
+
+ggplotly_clean(p_lo_area, tooltip = "text")
+```
+
+### Key Species Deep Dive
+
+```{r section-5-4-species, fig.height=9}
+# ---- Key species discard trend (Med focus) -----------------------------------
+key_species <- c("HKE", "MUT", "DPS", "NEP", "SOL")
+key_sp_lo_years <- c(HKE = 2017, MUT = 2017, DPS = 2017, NEP = 2019, SOL = 2017)
+
+disc_key_sp <- disc_lo %>%
+  filter(area == "Mediterranean & Black Sea",
+         species %in% key_species) %>%
+  group_by(species, year) %>%
+  summarise(
+    disc_t    = sum(discards_wt, na.rm = TRUE),
+    land_t    = sum(landings_wt, na.rm = TRUE),
+    disc_rate = 100 * disc_t / (land_t + disc_t),
+    .groups = "drop"
+  )
+
+# LO start annotations
+lo_annot <- tibble(
+  species = names(key_sp_lo_years),
+  lo_year = unname(key_sp_lo_years)
+)
+
+p_key_sp <- ggplot(disc_key_sp, aes(x = year, y = disc_rate, colour = species,
+                                      text = paste0(species, " (", year, ")",
+                                                    "\nDiscard rate: ", round(disc_rate, 1), "%",
+                                                    "\nDiscards: ", scales::comma(disc_t, accuracy = 1), " t"))) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_vline(data = lo_annot, aes(xintercept = lo_year),
+             linetype = "dashed", colour = "grey50", alpha = 0.6) +
+  facet_wrap(~ species, scales = "free_y", ncol = 1) +
+  scale_colour_manual(values = c(
+    "HKE" = "#E64B35", "MUT" = "#4DBBD5", "DPS" = "#00A087",
+    "NEP" = "#3C5488", "SOL" = "#B09C85"
+  ), guide = "none") +
+  scale_x_continuous(breaks = 2013:2024) +
+  labs(title = "Mediterranean Key Species — Discard Rate Trend",
+       subtitle = "Dashed lines = LO start year for each species. HKE/MUT/DPS/SOL: 2017 pilot; NEP: 2019.",
+       x = NULL, y = "Discard rate (%)",
+       caption = "Source: STECF FDI 2025. Only records with valid discard data.") +
+  theme_fdi()
+
+ggplotly_clean(p_key_sp, tooltip = "text") %>%
+  plotly::layout(height = 800)
+```
+
+### Top 10 Before/After
+
+```{r section-5-4-top10, fig.height=8}
+# ---- Paired bar: before/after LO for top 10 species by discard volume -------
+top_disc_sp <- disc_lo %>%
+  filter(lo_flag, area == "Mediterranean & Black Sea") %>%
+  group_by(species) %>%
+  summarise(total_disc = sum(discards_wt, na.rm = TRUE), .groups = "drop") %>%
+  slice_max(total_disc, n = 10) %>%
+  pull(species)
+
+disc_ba <- disc_lo %>%
+  filter(lo_flag, area == "Mediterranean & Black Sea", species %in% top_disc_sp) %>%
+  mutate(period = if_else(year < 2019, "Before (2013\u20132018)", "After (2019\u20132024)")) %>%
+  group_by(species, period) %>%
+  summarise(
+    disc_t    = sum(discards_wt, na.rm = TRUE),
+    land_t    = sum(landings_wt, na.rm = TRUE),
+    disc_rate = 100 * disc_t / (land_t + disc_t),
+    .groups = "drop"
+  ) %>%
+  mutate(period = factor(period, levels = c("Before (2013\u20132018)", "After (2019\u20132024)")))
+
+p_ba <- ggplot(disc_ba, aes(x = reorder(species, disc_rate), y = disc_rate,
+                              fill = period,
+                              text = paste0(species, " — ", period,
+                                            "\nDiscard rate: ", round(disc_rate, 1), "%",
+                                            "\nDiscards: ", scales::comma(disc_t, accuracy = 1), " t"))) +
+  geom_col(position = "dodge", width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c("Before (2013\u20132018)" = "#3C5488", "After (2019\u20132024)" = "#E64B35")) +
+  labs(title = "Top 10 Med LO Species — Discard Rate Before vs After Full LO",
+       subtitle = "Before = 2013–2018, After = 2019–2024. Did the LO reduce discards?",
+       x = NULL, y = "Discard rate (%)", fill = NULL,
+       caption = "Source: STECF FDI 2025. Only LO-covered species in Mediterranean.") +
+  theme_fdi()
+
+ggplotly_clean(p_ba, tooltip = "text")
+```
+
+### LO Exemptions {.tabset}
+
+> **Key exemptions still in force** (CINEA 2021, Delegated Regulation EU 2017/86):
+>
+> - **NEP** (Norway lobster): high survivability in pots/traps — discards legal in many areas
+> - **Sole**: high survivability (beam trawl, 7d) + de minimis (nets, gillnets)
+> - **Hake**: de minimis 5–6% (Med trawls, SW Waters trawls)
+> - **Plaice**: high survivability (various gears, North Sea & NW Waters)
+> - **Skates/rays**: high survivability (all gears, most areas)
+> - **Med small pelagics** (ANE, PIL): de minimis 5% as bycatch in bottom trawls
+>
+> These exemptions mean reported discards for these species may remain **non-zero even under full LO compliance** — absence of discard reduction ≠ non-compliance.
+>
+> *Source: CINEA (2021) "Synthesis of the landing obligation measures and discard rates", ISBN 978-92-9460-565-8*
+
+```{r section-5-4-exemptions-table}
+# ---- STECF EWG 25-10 Annex 3 exemption data ---------------------------------
+if (!is.null(lo_exemptions)) {
+  reactable(
+    lo_exemptions %>%
+      select(region, exemption_type, species, gear_code, area_detail,
+             country, landings_tonnes, discard_rate_ms, discard_rate_fillin) %>%
+      mutate(
+        discard_rate_pct = coalesce(discard_rate_fillin, discard_rate_ms) * 100,
+        landings_tonnes = round(landings_tonnes, 1)
+      ) %>%
+      filter(!is.na(landings_tonnes)),
+    groupBy   = c("region", "exemption_type"),
+    columns   = list(
+      region           = colDef(name = "Region", minWidth = 120),
+      exemption_type   = colDef(name = "Exemption", minWidth = 100),
+      species          = colDef(name = "Species", minWidth = 130),
+      gear_code        = colDef(name = "Gear"),
+      area_detail      = colDef(name = "Area detail", minWidth = 150),
+      country          = colDef(name = "Country"),
+      landings_tonnes  = colDef(name = "Landings (t)", format = colFormat(separators = TRUE, digits = 1)),
+      discard_rate_ms  = colDef(show = FALSE),
+      discard_rate_fillin = colDef(show = FALSE),
+      discard_rate_pct = colDef(name = "Discard rate %", format = colFormat(digits = 1))
+    ),
+    searchable = TRUE, striped = TRUE, compact = TRUE, fullWidth = TRUE,
+    defaultPageSize = 20
+  )
+} else {
+  cat("*Exemption data not available — place STECF_EWG_25-10_Annex3_Exemptions.xlsx in data/raw/ and re-run prepare_data.R*")
+}
+```
+
+*Data from STECF EWG 25-10, Annex 3 (Tables 1, 2, 5, 8, 10). Discard rates are per-exemption × species × country for 2024.*
+
+#### Discard Rate by Species × Exemption Type
+
+```{r section-5-4-plot11b, fig.height=9}
+# ---- Plot 11b: Lollipop — discard rate by species × exemption type ----------
+if (!is.null(lo_exemptions)) {
+  ex_sp <- lo_exemptions %>%
+    mutate(disc_rate = coalesce(discard_rate_fillin, discard_rate_ms) * 100) %>%
+    filter(!is.na(disc_rate), disc_rate > 0) %>%
+    group_by(species, exemption_type) %>%
+    summarise(
+      mean_disc_rate = weighted.mean(disc_rate, landings_tonnes, na.rm = TRUE),
+      total_land     = sum(landings_tonnes, na.rm = TRUE),
+      n_records      = n(),
+      .groups = "drop"
+    ) %>%
+    filter(n_records >= 2, total_land > 1) %>%
+    arrange(desc(mean_disc_rate)) %>%
+    head(25)
+
+  p_ex_sp <- plot_ly(ex_sp, x = ~mean_disc_rate,
+                      y = ~reorder(species, mean_disc_rate),
+                      color = ~exemption_type,
+                      colors = c("De minimis" = "#3C5488", "Survivability" = "#E64B35"),
+                      type = "scatter", mode = "markers",
+                      marker = list(size = 10),
+                      text = ~paste0(species, " (", exemption_type, ")",
+                                     "\nDiscard rate: ", round(mean_disc_rate, 1), "%",
+                                     "\nLandings: ", scales::comma(total_land, accuracy = 1), " t"),
+                      hoverinfo = "text") %>%
+    layout(title = "Discard Rate by Species Under LO Exemptions (2024)",
+           xaxis = list(title = "Weighted mean discard rate (%)"),
+           yaxis = list(title = ""),
+           showlegend = TRUE,
+           legend = list(orientation = "h", y = -0.1)) %>%
+    config(displayModeBar = FALSE)
+
+  p_ex_sp
+}
+```
+
+#### Discard Rate by Region
+
+```{r section-5-4-plot11c, fig.height=6}
+# ---- Plot 11c: Grouped bar — discard rate by region × exemption type --------
+if (!is.null(lo_exemptions)) {
+  ex_region <- lo_exemptions %>%
+    mutate(disc_rate = coalesce(discard_rate_fillin, discard_rate_ms) * 100) %>%
+    filter(!is.na(disc_rate), disc_rate > 0) %>%
+    group_by(region, exemption_type) %>%
+    summarise(
+      mean_disc_rate = weighted.mean(disc_rate, landings_tonnes, na.rm = TRUE),
+      total_land     = sum(landings_tonnes, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  p_ex_reg <- ggplot(ex_region, aes(x = region, y = mean_disc_rate,
+                                      fill = exemption_type,
+                                      text = paste0(region, " — ", exemption_type,
+                                                    "\nDiscard rate: ", round(mean_disc_rate, 1), "%",
+                                                    "\nLandings: ", scales::comma(total_land, accuracy = 1), " t"))) +
+    geom_col(position = "dodge", width = 0.7) +
+    scale_fill_manual(values = c("De minimis" = "#3C5488", "Survivability" = "#E64B35")) +
+    labs(title = "Mean Discard Rate Under Exemptions by Region (2024)",
+         subtitle = "Weighted by landings. De minimis vs survivability exemptions.",
+         x = NULL, y = "Weighted mean discard rate (%)", fill = "Exemption type",
+         caption = "Source: STECF EWG 25-10, Annex 3") +
+    theme_fdi() +
+    theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+  ggplotly_clean(p_ex_reg, tooltip = "text")
+}
+```
+
+#### Country Comparison
+
+```{r section-5-4-plot11d-data}
+# ---- Dashboard 3: Exemption Country Comparison -------------------------------
+if (!is.null(lo_exemptions)) {
+  ex_dash3 <- lo_exemptions %>%
+    mutate(disc_rate_pct = coalesce(discard_rate_fillin, discard_rate_ms) * 100) %>%
+    filter(!is.na(disc_rate_pct), !is.na(country), !is.na(landings_tonnes)) %>%
+    select(region, exemption_type, species, gear_code, country,
+           landings_tonnes, disc_rate_pct)
+
+  sd_exempt <- SharedData$new(ex_dash3, group = "dash3")
+}
+```
+
+```{r section-5-4-plot11d, fig.height=10}
+if (!is.null(lo_exemptions)) {
+  bscols(widths = c(2, 10),
+    list(
+      filter_select("d3_exemption", "Exemption type", sd_exempt, ~exemption_type, multiple = FALSE),
+      filter_select("d3_species", "Species", sd_exempt, ~species, multiple = TRUE),
+      filter_select("d3_region", "Region", sd_exempt, ~region, multiple = FALSE)
+    ),
+    list(
+      # Horizontal bar: discard rate by country
+      plot_ly(sd_exempt, y = ~country, x = ~disc_rate_pct,
+              color = ~species, type = "bar", orientation = "h",
+              hovertext = ~paste0(country, " — ", species,
+                             "\n", exemption_type,
+                             "\nDiscard rate: ", round(disc_rate_pct, 1), "%",
+                             "\nLandings: ", round(landings_tonnes, 1), " t"),
+              hoverinfo = "text", textposition = "none") %>%
+        layout(title = "Discard Rate by Country Under Exemptions",
+               barmode = "group",
+               xaxis = list(title = "Discard rate (%)"),
+               yaxis = list(title = "", categoryorder = "total ascending")) %>%
+        highlight("plotly_click", persistent = TRUE, dynamic = FALSE) %>%
+        config(displayModeBar = FALSE),
+      # Linked table
+      reactable(
+        ex_dash3,
+        groupBy  = c("exemption_type", "species"),
+        columns  = list(
+          region          = colDef(name = "Region"),
+          exemption_type  = colDef(name = "Exemption"),
+          species         = colDef(name = "Species", minWidth = 120),
+          gear_code       = colDef(name = "Gear"),
+          country         = colDef(name = "Country"),
+          landings_tonnes = colDef(name = "Landings (t)", aggregate = "sum",
+                                   format = colFormat(separators = TRUE, digits = 1)),
+          disc_rate_pct   = colDef(name = "Discard rate %", aggregate = "mean",
+                                   format = colFormat(digits = 1))
+        ),
+        searchable = TRUE, striped = TRUE, compact = TRUE,
+        fullWidth = TRUE, defaultPageSize = 15
+      )
+    )
+  )
+}
+```
+
+#### Exemption Treemap
+
+```{r section-5-4-plot11e, fig.height=8}
+# ---- Plot 11e: Treemap — exemption → species → country ----------------------
+if (!is.null(lo_exemptions)) {
+  ex_tree <- lo_exemptions %>%
+    filter(!is.na(landings_tonnes), landings_tonnes > 0, !is.na(country)) %>%
+    mutate(disc_rate = coalesce(discard_rate_fillin, discard_rate_ms))
+
+  # Build treemap hierarchy
+  tree_l3 <- ex_tree %>%
+    group_by(exemption_type, species, country) %>%
+    summarise(
+      land_t    = sum(landings_tonnes, na.rm = TRUE),
+      disc_rate = weighted.mean(disc_rate, landings_tonnes, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    filter(land_t > 0) %>%
+    mutate(
+      ids     = paste(exemption_type, species, country, sep = " / "),
+      labels  = country,
+      parents = paste(exemption_type, species, sep = " / "),
+      values  = land_t,
+      color   = disc_rate
+    )
+
+  tree_l2 <- tree_l3 %>%
+    group_by(exemption_type, species) %>%
+    summarise(values = sum(land_t), color = weighted.mean(disc_rate, land_t, na.rm = TRUE),
+              .groups = "drop") %>%
+    mutate(
+      ids     = paste(exemption_type, species, sep = " / "),
+      labels  = species,
+      parents = exemption_type
+    )
+
+  tree_l1 <- tree_l2 %>%
+    group_by(exemption_type) %>%
+    summarise(
+      color  = ifelse(sum(values[!is.na(color)]) > 0,
+                       weighted.mean(color[!is.na(color)], values[!is.na(color)]),
+                       NA_real_),
+      values = sum(values),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      ids     = exemption_type,
+      labels  = exemption_type,
+      parents = ""
+    )
+
+  tree_all <- bind_rows(
+    tree_l1 %>% select(ids, labels, parents, values, color),
+    tree_l2 %>% select(ids, labels, parents, values, color),
+    tree_l3 %>% select(ids, labels, parents, values, color)
+  )
+
+  plot_ly(tree_all,
+          ids     = ~ids,
+          labels  = ~labels,
+          parents = ~parents,
+          values  = ~values,
+          type    = "treemap",
+          branchvalues = "total",
+          marker  = list(
+            colors     = ~color,
+            colorscale = list(c(0, "#4DBBD5"), c(0.5, "#FFFFBF"), c(1, "#E64B35")),
+            showscale  = TRUE,
+            colorbar   = list(title = "Discard rate")
+          ),
+          hoverinfo = "label+value+percent parent",
+          textinfo  = "label+value") %>%
+    layout(title = list(text = "LO Exemptions: Exemption Type \u2192 Species \u2192 Country (sized by landings, coloured by discard rate)"),
+           margin = list(t = 60)) %>%
+    config(displayModeBar = FALSE)
+}
+```
+
+## Most Discarded Species {.tabset}
+
+### Top Discarded Species
+
+```{r section-5-5-top, fig.height=7}
+# ---- Top 10 species by discard weight (Med, with area filter) ----------------
+disc_sp <- disc_data %>%
+  filter(has_valid_disc) %>%
+  group_by(area, species) %>%
+  summarise(
+    discards_t = sum(discards_wt, na.rm = TRUE),
+    landings_t = sum(landings_wt, na.rm = TRUE),
+    disc_rate  = 100 * discards_t / (landings_t + discards_t),
+    .groups = "drop"
+  ) %>%
+  filter(discards_t > 0)
+
+# Med top 10
+med_disc_top <- disc_sp %>%
+  filter(area == "Mediterranean & Black Sea") %>%
+  slice_max(discards_t, n = 15)
+
+p_disc_top <- ggplot(med_disc_top, aes(x = reorder(species, discards_t),
+                                        y = discards_t / 1e3,
+                                        fill = disc_rate,
+                                        text = paste0(species,
+                                                      "\nDiscards: ", scales::comma(discards_t, accuracy = 1), " t",
+                                                      "\nDiscard rate: ", round(disc_rate, 1), "%"))) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_viridis_c(option = "inferno", direction = -1, name = "Discard rate %") +
+  labs(title = "Top 15 Most Discarded Species — Mediterranean (2013\u20132024)",
+       subtitle = "Bar height = discard volume, colour = discard rate.",
+       x = NULL, y = "Discards (thousand tonnes)",
+       caption = "Source: STECF FDI 2025. Only records with valid discard data.") +
+  theme_fdi() +
+  theme(legend.position = "right")
+
+ggplotly_clean(p_disc_top, tooltip = "text")
+```
+
+### Discard Sunburst
+
+```{r section-5-5-sunburst, fig.height=8}
+# ---- Sunburst: area → gear → species, sized by discards ---------------------
+sun_disc <- disc_data %>%
+  filter(has_valid_disc, area == "Mediterranean & Black Sea",
+         species %in% med_disc_top$species) %>%
+  mutate(gear_grp = if_else(gear_type %in% top_gears, gear_type, "Other")) %>%
+  group_by(sub_region, gear_grp, species) %>%
+  summarise(disc_t = sum(discards_wt, na.rm = TRUE), .groups = "drop") %>%
+  filter(disc_t > 0)
+
+# Build sunburst hierarchy
+sun_d3 <- sun_disc %>%
+  mutate(ids = paste(sub_region, gear_grp, species, sep = " - "),
+         labels = species, parents = paste(sub_region, gear_grp, sep = " - "),
+         values = disc_t)
+
+sun_d2 <- sun_disc %>%
+  group_by(sub_region, gear_grp) %>%
+  summarise(values = sum(disc_t), .groups = "drop") %>%
+  mutate(ids = paste(sub_region, gear_grp, sep = " - "),
+         labels = gear_grp, parents = sub_region)
+
+sun_d1 <- sun_disc %>%
+  group_by(sub_region) %>%
+  summarise(values = sum(disc_t), .groups = "drop") %>%
+  mutate(ids = sub_region, labels = sub_region, parents = "")
+
+sun_disc_all <- bind_rows(
+  sun_d1 %>% select(ids, labels, parents, values),
+  sun_d2 %>% select(ids, labels, parents, values),
+  sun_d3 %>% select(ids, labels, parents, values)
+)
+
+plot_ly(sun_disc_all,
+        ids = ~ids, labels = ~labels, parents = ~parents, values = ~values,
+        type = "sunburst", branchvalues = "total",
+        hoverinfo = "label+value+percent parent",
+        textinfo = "label") %>%
+  layout(title = list(text = "Mediterranean Discards: Sub-region \u2192 Gear \u2192 Species"),
+         margin = list(t = 50)) %>%
+  config(displayModeBar = FALSE)
+```
+
+### Species × Area Drilldown
+
+```{r section-5-5-drilldown}
+# ---- Highcharter drilldown: sub_region → species (discards) ------------------
+disc_drill <- disc_data %>%
+  filter(has_valid_disc, area == "Mediterranean & Black Sea") %>%
+  group_by(sub_region, species) %>%
+  summarise(disc_t = sum(discards_wt, na.rm = TRUE), .groups = "drop") %>%
+  filter(disc_t > 0) %>%
+  group_by(sub_region) %>%
+  slice_max(disc_t, n = 10) %>%
+  ungroup()
+
+# Level 1: sub_region totals
+drill_l1 <- disc_drill %>%
+  group_by(sub_region) %>%
+  summarise(y = sum(disc_t), .groups = "drop") %>%
+  mutate(name = sub_region, drilldown = sub_region) %>%
+  arrange(desc(y))
+
+# Level 2: species within each sub_region
+drill_l2 <- disc_drill %>%
+  group_by(sub_region) %>%
+  group_map(~ {
+    list(
+      id   = .y$sub_region,
+      name = .y$sub_region,
+      data = list_parse2(
+        tibble(name = .x$species, y = .x$disc_t) %>% arrange(desc(y))
+      )
+    )
+  })
+
+highchart() %>%
+  hc_chart(type = "column") %>%
+  hc_title(text = "Mediterranean Discards by Sub-region (click to drill down to species)") %>%
+  hc_subtitle(text = "Top 10 species per sub-region by discard weight (2013\u20132024)") %>%
+  hc_xAxis(type = "category") %>%
+  hc_yAxis(title = list(text = "Discards (tonnes)")) %>%
+  hc_add_series(
+    data = list_parse(drill_l1 %>% select(name, y, drilldown)),
+    name = "Sub-region", colorByPoint = TRUE
+  ) %>%
+  hc_drilldown(
+    allowPointDrilldown = TRUE,
+    series = drill_l2
+  ) %>%
+  hc_tooltip(pointFormat = "<b>{point.name}</b>: {point.y:,.0f} t") %>%
+  hc_plotOptions(column = list(dataLabels = list(enabled = FALSE)))
+```
+
+# Métier Shift Detection {.tabset}
+
+Have fleet compositions in the Mediterranean shifted over time, possibly in response to the Landing Obligation or the West Med MAP? We use the effort-by-country data to construct **fleet profiles** (proportion of fishing days across métiers), then apply **PCA** and **clustering** to detect structural changes.
+
+## Fleet Profiles
+
+```{r section-6-1-prep}
+# ---- Build fleet profile matrix: country × year → métier shares -------------
+# Define métier as gear_type × target_assemblage
+fleet_raw <- effort_metier %>%
+  mutate(metier = paste(gear_type, target_assemblage, sep = "_")) %>%
+  group_by(country, year, metier) %>%
+  summarise(fishing_days = sum(total_fishing_days, na.rm = TRUE), .groups = "drop")
+
+# Keep only métiers that represent ≥1% of total Med effort to avoid noise
+total_fd <- sum(fleet_raw$fishing_days, na.rm = TRUE)
+major_metiers <- fleet_raw %>%
+  group_by(metier) %>%
+  summarise(fd = sum(fishing_days, na.rm = TRUE), .groups = "drop") %>%
+  filter(fd / total_fd >= 0.01) %>%
+  pull(metier)
+
+fleet_filtered <- fleet_raw %>%
+  mutate(metier = if_else(metier %in% major_metiers, metier, "OTHER")) %>%
+  group_by(country, year, metier) %>%
+  summarise(fishing_days = sum(fishing_days, na.rm = TRUE), .groups = "drop")
+
+# Pivot to wide: rows = country-year, columns = métier proportions
+fleet_wide <- fleet_filtered %>%
+  group_by(country, year) %>%
+  mutate(share = fishing_days / sum(fishing_days, na.rm = TRUE)) %>%
+  ungroup() %>%
+  select(country, year, metier, share) %>%
+  pivot_wider(names_from = metier, values_from = share, values_fill = 0)
+
+# Matrix for PCA/clustering (exclude country/year labels)
+metier_cols <- setdiff(names(fleet_wide), c("country", "year"))
+fleet_mat <- as.matrix(fleet_wide[, metier_cols])
+rownames(fleet_mat) <- paste(fleet_wide$country, fleet_wide$year, sep = "_")
+
+cat(sprintf("Fleet profile matrix: %d country-years × %d métiers\n",
+            nrow(fleet_mat), ncol(fleet_mat)))
+cat("Major métiers (≥1% of total):", paste(sort(major_metiers), collapse = ", "), "\n")
+```
+
+```{r section-6-1-heatmap, fig.height=10, fig.width=10}
+# ---- Fleet composition heatmap: country × métier (latest year) --------------
+fleet_latest <- fleet_wide %>%
+  filter(year == max(year, na.rm = TRUE)) %>%
+  pivot_longer(all_of(metier_cols), names_to = "metier", values_to = "share") %>%
+  filter(share > 0)
+
+p_fleet_hm <- ggplot(fleet_latest, aes(x = metier, y = reorder(country, -share),
+                                         fill = share * 100,
+                                         text = paste0(country, " — ", metier,
+                                                       "\nShare: ", round(share * 100, 1), "%"))) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  scale_fill_viridis_c(option = "mako", direction = -1, name = "% of effort") +
+  labs(title = paste0("Mediterranean Fleet Profiles — ", max(fleet_wide$year)),
+       subtitle = "% of total fishing days per métier (gear_target). Major métiers only.",
+       x = "Métier (gear_target assemblage)", y = NULL,
+       caption = "Source: STECF FDI 2025 — Effort by country (Med only)") +
+  theme_fdi() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "right")
+
+ggplotly_clean(p_fleet_hm, tooltip = "text") %>%
+  plotly::layout(height = 600)
+```
+
+```{r section-6-1-stacked, fig.height=8}
+# ---- Stacked area: fleet composition over time (top 5 countries) -------------
+top5_countries <- fleet_wide %>%
+  group_by(country) %>%
+  summarise(total = sum(fleet_mat[paste(country, year, sep = "_"), ], na.rm = TRUE),
+            .groups = "drop")
+
+# Simpler: use raw fishing days
+top5 <- effort_metier %>%
+  group_by(country) %>%
+  summarise(fd = sum(total_fishing_days, na.rm = TRUE), .groups = "drop") %>%
+  slice_max(fd, n = 5) %>%
+  pull(country)
+
+fleet_top5 <- fleet_filtered %>%
+  filter(country %in% top5, metier != "OTHER") %>%
+  group_by(country, year, metier) %>%
+  summarise(fishing_days = sum(fishing_days, na.rm = TRUE), .groups = "drop")
+
+# Native plotly stacked area per country (ggplotly drops geom_area fills)
+metier_colors <- setNames(
+  c(as.character(paletteer::paletteer_d("pals::glasbey", n = length(major_metiers))), "#CCCCCC"),
+  c(sort(major_metiers), "OTHER")
+)
+# Keep only colors for métiers present in data
+used_metiers <- sort(unique(fleet_top5$metier))
+metier_colors <- metier_colors[names(metier_colors) %in% used_metiers]
+
+plots <- lapply(top5, function(cty) {
+  d_cty <- fleet_top5 %>% filter(country == cty) %>% arrange(year, metier)
+  p <- plot_ly()
+  for (m in names(metier_colors)) {
+    d_m <- d_cty %>% filter(metier == m) %>% arrange(year)
+    if (nrow(d_m) == 0) next
+    p <- p %>% add_trace(
+      data = d_m, x = ~year, y = ~(fishing_days / 1e3),
+      type = "scatter", mode = "lines", stackgroup = "one",
+      fillcolor = metier_colors[m],
+      line = list(color = metier_colors[m], width = 0.5),
+      name = m,
+      legendgroup = m,
+      showlegend = (cty == top5[1]),
+      hovertext = ~paste0(cty, " — ", m, " (", year, ")\n",
+                          scales::comma(fishing_days), " days"),
+      hoverinfo = "text"
+    )
+  }
+  p %>% layout(
+    annotations = list(list(
+      text = cty, xref = "paper", yref = "paper",
+      x = 0.5, y = 1.05, showarrow = FALSE, font = list(size = 13)
+    )),
+    xaxis = list(title = "", tickvals = seq(2013, 2024, 2)),
+    yaxis = list(title = "Fishing days (thousands)")
+  )
+})
+
+subplot(plots, nrows = length(top5), shareX = TRUE, titleY = TRUE) %>%
+  layout(
+    title = list(text = "Mediterranean Fleet Composition Over Time — Top 5 Countries"),
+    height = 900,
+    legend = list(orientation = "h", y = -0.05)
+  ) %>%
+  config(displayModeBar = FALSE)
+```
+
+## Dimensionality Reduction
+
+```{r section-6-2-pca}
+# ---- PCA on fleet composition matrix ----------------------------------------
+# Hellinger transform (suitable for compositional data)
+fleet_hell <- sqrt(fleet_mat)
+
+# Remove rows with any NA/NaN/Inf (e.g. countries with zero total effort in a year)
+valid_rows <- complete.cases(fleet_hell) & apply(fleet_hell, 1, function(r) all(is.finite(r)))
+fleet_hell <- fleet_hell[valid_rows, ]
+fleet_wide_valid <- fleet_wide[valid_rows, ]
+
+pca_res <- prcomp(fleet_hell, center = TRUE, scale. = FALSE)
+
+# Variance explained
+var_exp <- summary(pca_res)$importance[2, 1:5] * 100
+cat("Variance explained by first 5 PCs:\n")
+cat(paste(sprintf("PC%d: %.1f%%", 1:5, var_exp), collapse = ", "), "\n")
+cat("Cumulative (PC1+PC2):", round(sum(var_exp[1:2]), 1), "%\n")
+```
+
+```{r section-6-2-biplot, fig.height=8}
+# ---- PCA biplot coloured by country, with year trajectories ------------------
+pca_scores <- as_tibble(pca_res$x[, 1:2]) %>%
+  mutate(
+    country = fleet_wide_valid$country,
+    year    = fleet_wide_valid$year,
+    label   = paste0(country, " ", year)
+  )
+
+# Country trajectories (connect same country across years)
+p_pca <- ggplot(pca_scores, aes(x = PC1, y = PC2, colour = country,
+                                  text = label)) +
+  geom_path(alpha = 0.4, linewidth = 0.5) +
+  geom_point(aes(size = year), alpha = 0.7) +
+  scale_size_continuous(range = c(1, 4), breaks = c(2013, 2018, 2024)) +
+  scale_colour_manual(values = setNames(
+    paletteer::paletteer_d("pals::glasbey", n = n_distinct(pca_scores$country)),
+    sort(unique(pca_scores$country))
+  )) +
+  labs(title = paste0("PCA of Med Fleet Profiles (PC1: ", round(var_exp[1], 1),
+                       "%, PC2: ", round(var_exp[2], 1), "%)"),
+       subtitle = "Each point = country-year. Lines connect same country over time. Larger = more recent.",
+       x = paste0("PC1 (", round(var_exp[1], 1), "%)"),
+       y = paste0("PC2 (", round(var_exp[2], 1), "%)"),
+       colour = "Country", size = "Year",
+       caption = "Hellinger-transformed métier shares. Source: STECF FDI 2025.") +
+  theme_fdi() +
+  theme(legend.position = "right")
+
+ggplotly_clean(p_pca, tooltip = "text")
+```
+
+```{r section-6-2-loadings, fig.height=6}
+# ---- PCA loadings: which métiers drive the axes? ----------------------------
+loadings <- as_tibble(pca_res$rotation[, 1:2], rownames = "metier")
+
+p_load <- ggplot(loadings, aes(x = PC1, y = PC2, label = metier)) +
+  geom_segment(aes(xend = 0, yend = 0), arrow = arrow(length = unit(0.15, "cm")),
+               colour = "#E64B35", alpha = 0.6) +
+  ggrepel::geom_text_repel(size = 3, max.overlaps = 15) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.3) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.3) +
+  labs(title = "PCA Loadings — Which Métiers Drive Fleet Separation?",
+       subtitle = "Arrows point from origin to loading position. Longer = stronger influence.",
+       x = paste0("PC1 (", round(var_exp[1], 1), "%)"),
+       y = paste0("PC2 (", round(var_exp[2], 1), "%)")) +
+  theme_fdi()
+
+p_load
+```
+
+## Clustering
+
+```{r section-6-3-optimal-k, fig.height=6}
+# ---- Optimal number of clusters (silhouette method) -------------------------
+set.seed(42)
+sil_widths <- sapply(2:8, function(k) {
+  km <- kmeans(fleet_hell, centers = k, nstart = 25)
+  ss <- cluster::silhouette(km$cluster, dist(fleet_hell))
+  mean(ss[, 3])
+})
+
+sil_df <- tibble(k = 2:8, silhouette = sil_widths)
+
+p_sil <- ggplot(sil_df, aes(x = k, y = silhouette)) +
+  geom_line(linewidth = 1, colour = "#3C5488") +
+  geom_point(size = 3, colour = "#E64B35") +
+  geom_vline(xintercept = sil_df$k[which.max(sil_df$silhouette)],
+             linetype = "dashed", colour = "grey40") +
+  scale_x_continuous(breaks = 2:8) +
+  labs(title = "Optimal Number of Clusters (Silhouette Method)",
+       subtitle = paste0("Best k = ", sil_df$k[which.max(sil_df$silhouette)],
+                          " (avg silhouette = ", round(max(sil_widths), 3), ")"),
+       x = "Number of clusters (k)", y = "Average silhouette width") +
+  theme_fdi()
+
+p_sil
+```
+
+```{r section-6-3-kmeans}
+# ---- K-means clustering -----------------------------------------------------
+# Use the optimal k from silhouette (typically 3-5)
+# Run for k=2 through k=6, pick best silhouette
+sil_scores <- sapply(2:6, function(k) {
+  km <- kmeans(fleet_hell, centers = k, nstart = 25)
+  ss <- cluster::silhouette(km$cluster, dist(fleet_hell))
+  mean(ss[, 3])
+})
+best_k <- which.max(sil_scores) + 1
+cat("Best k:", best_k, "(silhouette:", round(max(sil_scores), 3), ")\n")
+
+km_final <- kmeans(fleet_hell, centers = best_k, nstart = 25)
+pca_scores$cluster <- factor(km_final$cluster)
+```
+
+```{r section-6-3-dashboard, fig.height=10}
+# ---- Dashboard 5: Cluster Membership Explorer --------------------------------
+pca_scores$cluster_label <- paste("Cluster", pca_scores$cluster)
+
+sd_clust <- SharedData$new(pca_scores, group = "dash5")
+
+bscols(widths = c(3, 9),
+  list(
+    filter_select("d5_country", "Country", sd_clust, ~country, multiple = TRUE),
+    filter_select("d5_cluster", "Cluster", sd_clust, ~cluster_label, multiple = TRUE)
+  ),
+  list(
+    # PCA scatter coloured by cluster
+    plot_ly(sd_clust, x = ~PC1, y = ~PC2, color = ~cluster_label,
+            colors = "Set1",
+            size = ~year, sizes = c(30, 200),
+            type = "scatter", mode = "markers",
+            text = ~paste0(country, " (", year, ")\nCluster: ", cluster_label),
+            hoverinfo = "text") %>%
+      layout(title = paste0("Fleet Profiles — K-Means (k=", best_k, ")"),
+             xaxis = list(title = paste0("PC1 (", round(var_exp[1], 1), "%)")),
+             yaxis = list(title = paste0("PC2 (", round(var_exp[2], 1), "%)"))) %>%
+      highlight("plotly_click", persistent = TRUE, dynamic = FALSE) %>%
+      config(displayModeBar = FALSE),
+    # Detail table
+    DT::datatable(
+      pca_scores %>% select(country, year, cluster_label, PC1, PC2) %>%
+        mutate(PC1 = round(PC1, 3), PC2 = round(PC2, 3)),
+      options = list(scrollY = "400px", pageLength = 20),
+      rownames = FALSE
+    )
+  )
+)
+```
+
+```{r section-6-3-summary}
+# ---- Cluster summary table ---------------------------------------------------
+cluster_summary <- pca_scores %>%
+  group_by(cluster_label) %>%
+  summarise(
+    n_obs      = n(),
+    countries  = paste(sort(unique(country)), collapse = ", "),
+    year_range = paste(range(year), collapse = "\u2013"),
+    .groups = "drop"
+  )
+
+reactable(
+  cluster_summary,
+  columns = list(
+    cluster_label = colDef(name = "Cluster"),
+    n_obs         = colDef(name = "Observations"),
+    countries     = colDef(name = "Countries", minWidth = 300),
+    year_range    = colDef(name = "Year range")
+  ),
+  striped = TRUE, compact = TRUE, fullWidth = TRUE
+)
+```
+
+```{r section-6-3-profiles, fig.height=7}
+# ---- Cluster centres: what defines each cluster? ----------------------------
+centres <- as_tibble(km_final$centers, rownames = "cluster") %>%
+  pivot_longer(-cluster, names_to = "metier", values_to = "value") %>%
+  mutate(cluster = paste("Cluster", cluster))
+
+# Keep only métiers with meaningful loadings
+top_metiers <- centres %>%
+  group_by(metier) %>%
+  summarise(max_val = max(value), .groups = "drop") %>%
+  slice_max(max_val, n = 10) %>%
+  pull(metier)
+
+p_centres <- ggplot(centres %>% filter(metier %in% top_metiers),
+                     aes(x = reorder(metier, -value), y = value, fill = cluster)) +
+  geom_col(position = "dodge", width = 0.7) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(title = "Cluster Profiles — Mean Métier Shares",
+       subtitle = "What fishing pattern defines each cluster?",
+       x = "Métier", y = "Mean Hellinger-transformed share", fill = NULL) +
+  theme_fdi() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_centres
+```
+
+## Temporal Transitions
+
+```{r section-6-4-tile, fig.height=8, fig.width=10}
+# ---- Tile plot: cluster membership by country over time ----------------------
+tile_data <- pca_scores %>%
+  select(country, year, cluster) %>%
+  arrange(country, year)
+
+p_tile <- ggplot(tile_data, aes(x = year, y = reorder(country, as.numeric(cluster)),
+                                  fill = cluster,
+                                  text = paste0(country, " (", year, "): Cluster ", cluster))) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  scale_fill_brewer(palette = "Set1") +
+  scale_x_continuous(breaks = 2013:2024) +
+  labs(title = "Mediterranean Fleet Cluster Membership Over Time",
+       subtitle = "Has any country shifted between fleet profile clusters?",
+       x = NULL, y = NULL, fill = "Cluster",
+       caption = "Source: STECF FDI 2025 — Med effort by country.") +
+  theme_fdi() +
+  theme(legend.position = "right")
+
+ggplotly_clean(p_tile, tooltip = "text") %>%
+  plotly::layout(height = 500)
+```
+
+```{r section-6-4-sankey, fig.height=8}
+# ---- Sankey: cluster transitions year-to-year --------------------------------
+# Build year-to-year transitions
+years_sorted <- sort(unique(pca_scores$year))
+
+# Create nodes: cluster × year
+nodes <- pca_scores %>%
+  distinct(year, cluster) %>%
+  arrange(year, cluster) %>%
+  mutate(node_label = paste0("Cl", cluster, " (", year, ")"),
+         node_id    = row_number() - 1)
+
+# Create links: for each country, link cluster(year) → cluster(year+1)
+links_list <- list()
+for (i in seq_len(length(years_sorted) - 1)) {
+  yr_from <- years_sorted[i]
+  yr_to   <- years_sorted[i + 1]
+
+  from_data <- pca_scores %>% filter(year == yr_from) %>% select(country, cluster_from = cluster)
+  to_data   <- pca_scores %>% filter(year == yr_to)   %>% select(country, cluster_to = cluster)
+
+  yr_links <- inner_join(from_data, to_data, by = "country") %>%
+    count(cluster_from, cluster_to, name = "value") %>%
+    left_join(nodes %>% filter(year == yr_from) %>% select(cluster, source = node_id),
+              by = c("cluster_from" = "cluster")) %>%
+    left_join(nodes %>% filter(year == yr_to)   %>% select(cluster, target = node_id),
+              by = c("cluster_to" = "cluster"))
+
+  links_list[[i]] <- yr_links
+}
+
+links <- bind_rows(links_list) %>% filter(!is.na(source), !is.na(target))
+
+# Colour nodes by cluster
+cluster_colors <- RColorBrewer::brewer.pal(max(3, best_k), "Set1")
+node_colors <- cluster_colors[as.integer(as.character(nodes$cluster))]
+
+plot_ly(
+  type = "sankey",
+  orientation = "h",
+  node = list(
+    label = nodes$node_label,
+    color = node_colors,
+    pad   = 15,
+    thickness = 20
+  ),
+  link = list(
+    source = links$source,
+    target = links$target,
+    value  = links$value,
+    color  = "rgba(200,200,200,0.4)"
+  )
+) %>%
+  layout(
+    title = list(text = "Fleet Cluster Transitions (Year-to-Year Sankey)"),
+    font  = list(size = 11),
+    margin = list(t = 50)
+  ) %>%
+  config(displayModeBar = FALSE)
+```
+
+## Interpretation
+
+```{r section-6-5-shifts, fig.height=7}
+# ---- Countries that changed cluster ------------------------------------------
+shifts <- tile_data %>%
+  group_by(country) %>%
+  summarise(
+    n_clusters   = n_distinct(cluster),
+    first_cluster = first(cluster),
+    last_cluster  = last(cluster),
+    changed       = first(cluster) != last(cluster),
+    .groups = "drop"
+  )
+
+n_changed <- sum(shifts$changed)
+n_total   <- nrow(shifts)
+```
+
+### Key findings
+
+- **`r n_changed` of `r n_total`** Mediterranean countries changed their dominant fleet cluster between 2013 and 2024.
+- The PCA reveals that **PC1** primarily separates fleets dominated by passive gears (gillnets: GTR/GNS) from those dominated by trawls (OTB) and purse seines (PS).
+- **PC2** captures secondary variation, typically separating longline-dominated fleets (LLS/LLD) from trap-focused (FPO) operations.
+
+```{r section-6-5-shift-table}
+reactable(
+  shifts %>% arrange(desc(changed), country),
+  columns = list(
+    country       = colDef(name = "Country", minWidth = 140),
+    n_clusters    = colDef(name = "Distinct clusters"),
+    first_cluster = colDef(name = "Cluster (2013)"),
+    last_cluster  = colDef(name = "Cluster (2024)"),
+    changed       = colDef(name = "Shifted?", cell = function(value) {
+      if (value) "\u2705 Yes" else "\u2014 No"
+    })
+  ),
+  striped = TRUE, compact = TRUE, fullWidth = TRUE
+)
+```
+
+### Limitations
+
+- **Confidentiality gaps**: Effort data marked `C` was excluded, potentially biasing effort shares for smaller countries.
+- **NK métiers**: Records with `NK` (not known) gear or target assemblage are grouped into `OTHER`, which may mask real activity.
+- **Compositional closure**: Because shares sum to 1, a decline in one métier mechanically raises others — standard PCA on closed compositions should be interpreted carefully (Hellinger transform mitigates but doesn't eliminate this).
+- **Causal attribution**: Observed shifts may reflect data reporting changes, fleet retirement, or market forces rather than regulatory responses.
+
+# Data Playground {.tabset}
+
+## Explore by Species
+
+```{r section-7-2-data}
+# ---- Species Explorer — Dashboard 4 -----------------------------------------
+# Aggregate catches by species × area × country × gear × year
+sp_explorer <- catches %>%
+  group_by(species, area, country, gear_type, year) %>%
+  summarise(
+    landings = round(sum(landings_wt, na.rm = TRUE), 1),
+    discards = round(sum(discards_wt, na.rm = TRUE), 1),
+    .groups  = "drop"
+  ) %>%
+  filter(landings > 0 | discards > 0)
+
+# Top 50 species by total landings (keep widget manageable)
+top_sp <- sp_explorer %>%
+  group_by(species) %>%
+  summarise(tot = sum(landings), .groups = "drop") %>%
+  slice_max(tot, n = 50) %>%
+  pull(species)
+
+sp_dash <- sp_explorer %>% filter(species %in% top_sp)
+cat("Species Explorer rows:", scales::comma(nrow(sp_dash)),
+    "| Species:", n_distinct(sp_dash$species), "\n")
+```
+
+*Select a species to see its landings trend, top countries, top gears, and detail table — all linked.*
+
+```{r section-7-2-dashboard, fig.height=10}
+sd_sp <- SharedData$new(sp_dash, group = "species-explorer")
+
+# --- Trend line data (aggregate to species × area × year) ---
+sp_trend <- sp_dash %>%
+  group_by(species, area, year) %>%
+  summarise(landings = sum(landings), .groups = "drop")
+sd_sp_trend <- SharedData$new(sp_trend, group = "species-explorer")
+
+# --- Top countries (aggregate to species × country) ---
+sp_country <- sp_dash %>%
+  group_by(species, country) %>%
+  summarise(landings = sum(landings), .groups = "drop") %>%
+  group_by(species) %>%
+  slice_max(landings, n = 15) %>%
+  ungroup()
+sd_sp_country <- SharedData$new(sp_country, group = "species-explorer")
+
+# --- Top gears (aggregate to species × gear_type) ---
+sp_gear <- sp_dash %>%
+  group_by(species, gear_type) %>%
+  summarise(landings = sum(landings), .groups = "drop") %>%
+  group_by(species) %>%
+  slice_max(landings, n = 10) %>%
+  ungroup()
+sd_sp_gear <- SharedData$new(sp_gear, group = "species-explorer")
+
+bscols(widths = c(2, 10),
+  list(
+    filter_select("sp_sel", "Select Species", sd_sp, ~species),
+    filter_slider("sp_yr",  "Year Range",     sd_sp, ~year, step = 1)
+  ),
+  list(
+    bscols(widths = c(6, 6),
+      # Panel 1: Landings trend by area
+      plot_ly(sd_sp_trend, x = ~year, y = ~landings, color = ~area,
+              type = "scatter", mode = "lines+markers",
+              text = ~paste0(area, " (", year, "): ", scales::comma(landings), " t"),
+              hoverinfo = "text") %>%
+        layout(title = "Landings Trend",
+               xaxis = list(title = "Year"),
+               yaxis = list(title = "Landings (tonnes)"),
+               showlegend = TRUE) %>%
+        config(displayModeBar = FALSE),
+      # Panel 2: Top countries
+      plot_ly(sd_sp_country, y = ~reorder(country, landings), x = ~landings,
+              type = "bar", orientation = "h",
+              hovertext = ~paste0(country, ": ", scales::comma(landings), " t"),
+              hoverinfo = "text",
+              textposition = "none",
+              marker = list(color = "#3498db")) %>%
+        layout(title = "Top Countries",
+               xaxis = list(title = "Total Landings (tonnes)"),
+               yaxis = list(title = "")) %>%
+        config(displayModeBar = FALSE)
+    ),
+    bscols(widths = c(6, 6),
+      # Panel 3: Top gears
+      plot_ly(sd_sp_gear, y = ~reorder(gear_type, landings), x = ~landings,
+              type = "bar", orientation = "h",
+              hovertext = ~paste0(gear_type, ": ", scales::comma(landings), " t"),
+              hoverinfo = "text",
+              textposition = "none",
+              marker = list(color = "#e67e22")) %>%
+        layout(title = "Top Gears",
+               xaxis = list(title = "Total Landings (tonnes)"),
+               yaxis = list(title = "")) %>%
+        config(displayModeBar = FALSE),
+      # Panel 4: Detail table
+      reactable(
+        sd_sp,
+        columns = list(
+          species   = colDef(name = "Species", minWidth = 80),
+          area      = colDef(name = "Area", minWidth = 120),
+          country   = colDef(name = "Country"),
+          gear_type = colDef(name = "Gear"),
+          year      = colDef(name = "Year"),
+          landings  = colDef(name = "Landings (t)", format = colFormat(separators = TRUE)),
+          discards  = colDef(name = "Discards (t)", format = colFormat(separators = TRUE))
+        ),
+        groupBy  = "area",
+        searchable = TRUE,
+        pagination = TRUE,
+        defaultPageSize = 10,
+        striped  = TRUE,
+        compact  = TRUE,
+        fullWidth = TRUE,
+        height   = 400
+      )
+    )
+  )
+)
+```
+
+# Synthesis & Key Findings
+
+```{r section-8-numbers, include=FALSE}
+# ---- Pre-compute synthesis numbers ------------------------------------------
+n_areas      <- n_distinct(catches$area)
+n_countries  <- n_distinct(catches$country)
+n_species    <- n_distinct(catches$species)
+year_range   <- paste(range(catches$year), collapse = "\u2013")
+
+total_land   <- sum(catches$landings_wt, na.rm = TRUE)
+total_disc   <- sum(catches$discards_wt, na.rm = TRUE)
+overall_disc_rate <- round(100 * total_disc / (total_land + total_disc), 1)
+
+# Med-specific
+med_catches  <- catches %>% filter(str_detect(area, "Med"))
+med_land     <- sum(med_catches$landings_wt, na.rm = TRUE)
+med_disc     <- sum(med_catches$discards_wt, na.rm = TRUE)
+med_disc_rate <- round(100 * med_disc / (med_land + med_disc), 1)
+
+# Confidentiality
+pct_c_overall <- round(100 * sum(catches$n_c_landings) / sum(catches$n_records), 1)
+```
+
+## Key Findings
+
+1. **Effort is declining overall** — fishing effort (days at sea and kW·days) has decreased across most EU sea basins over `r year_range`, consistent with fleet reduction policies under the CFP. The Mediterranean shows a marked drop post-2019, coinciding with the West Med MAP trawler effort limits.
+
+2. **Discard rates vary dramatically by gear** — the EU-wide discard rate is approximately **`r overall_disc_rate`%** of total catch weight. In the Mediterranean (`r med_disc_rate`%), bottom trawls (OTB) account for the bulk of discards, while passive gears (GNS, GTR, LLS) have near-zero discard rates.
+
+3. **The Landing Obligation has not eliminated discarding** — discard rates show modest declines in some areas post-LO, but exemptions (de minimis, survivability) cover a substantial portion of catches. The exemptions data shows `r if(!is.null(lo_exemptions)) nrow(lo_exemptions) else "N/A"` active exemption entries across EU sea basins.
+
+4. **Fleet composition is relatively stable** — PCA and clustering of métier profiles reveal that most Mediterranean countries maintained their fleet identity (gear mix) over the 12-year period. Shifts, where detected, are gradual and may reflect data quality changes rather than genuine fleet adaptation.
+
+5. **Confidentiality limits analysis** — approximately **`r pct_c_overall`%** of records have confidential (`C`) landings values, which are treated as `NA`. This disproportionately affects smaller countries and niche fisheries, creating potential bias in aggregated statistics.
+
+## Policy Implications
+
+- **West Med MAP monitoring**: The effort reduction visible in post-2019 data supports continued monitoring via FDI. However, the shift from effort to landings as the primary management lever requires better species-level data.
+- **Landing Obligation effectiveness**: The persistence of discarding alongside broad exemptions raises questions about whether the LO is achieving its conservation objectives in the Mediterranean.
+- **Data quality investment**: The high rate of confidential values undermines the analytical utility of the FDI dataset. Investment in data-sharing frameworks could substantially improve stock assessments and policy evaluation.
+
+## Limitations
+
+- **Confidential values** (`C`) are excluded — totals are lower-bound estimates.
+- **Discard sampling coverage** varies by country and year; some discard figures are model-estimated rather than observed.
+- **Métier classification** depends on self-reporting; `NK` (not known) entries blur fleet profiles.
+- **Causal inference** is not possible from this observational dataset — observed trends may reflect regulatory, economic, or environmental drivers simultaneously.
+
+## Possible Extensions
+
+- Spatial analysis using c-square effort data for fine-scale mapping
+- Linkage with AER (Annual Economic Report) data for economic dimensions
+- Time-series decomposition of effort trends (seasonal, trend, residual)
+- Species-level stock status overlay (GFCM/ICES assessments)
+
+# Technical Appendix {.tabset}
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```
+
+## Package Versions
+
+```{r pkg-versions}
+pkgs <- c("tidyverse", "plotly", "highcharter", "reactable", "crosstalk",
+           "rpivotTable", "DT", "echarts4r", "ggiraph", "cluster", "vegan",
+           "data.table", "htmltools", "readxl", "janitor", "scales")
+installed <- installed.packages()
+pkg_df <- tibble(
+  Package = pkgs,
+  Version = sapply(pkgs, function(p) {
+    if (p %in% rownames(installed)) as.character(packageVersion(p)) else "not installed"
+  })
+)
+reactable(pkg_df, striped = TRUE, compact = TRUE, fullWidth = FALSE,
+          defaultPageSize = 20)
+```
+
+## Data Citation
+
+**Primary data source:**
+
+> Scientific, Technical and Economic Committee for Fisheries (STECF) — Fisheries Dependent Information (FDI). EWG 25-10. Data dissemination portal: <https://stecf.ec.europa.eu/data-dissemination/fdi_en>
+
+**Dataset downloaded:** *"Effort, landings, catches, capacity, biological"* ZIP archive (2013–2024 data, last update 27 November 2025).
+
+**Exemptions data:** STECF EWG 25-10, Annex 3 — Landing Obligation Exemptions.
+
+## STECF Disclaimers
+
+The following disclaimers are reproduced verbatim from official STECF publications:
+
+> *"The data submitted to the FDI data call are provided under the responsibility of the Member States. The Scientific, Technical and Economic Committee for Fisheries (STECF) cannot guarantee the accuracy or completeness of the data."*
+
+> *"The discard estimates provided by Member States are derived from scientific sampling programmes carried out under the EU Data Collection Framework (DCF/EU-MAP). These estimates may not support the level of disaggregation required by the FDI data call. Users should exercise caution when interpreting discard data at fine spatial or temporal scales."*
+
+> *"Confidential data (marked as 'C' in the original dataset) have been suppressed to protect the identity of individual vessels or operators, in accordance with Regulation (EC) No 223/2009 on European statistics."*
+
+## Reproducibility
+
+To reproduce this analysis:
+
+1. Download the FDI ZIP from <https://stecf.ec.europa.eu/data-dissemination/fdi_en>
+2. Extract CSV files into `data/raw/`
+3. Run `Rscript R/prepare_data.R` to generate processed `.rds` files
+4. Knit `fdi_explorer.Rmd` with `rmarkdown::render("fdi_explorer.Rmd")`
