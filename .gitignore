@@ -5,8 +5,8 @@ data/processed/*.rds
 .Rproj.user
 *.RData
 
-# HTML output (too large for git — share separately)
-*.html
+# HTML output is committed for GitHub Pages hosting
+# *.html
 
 # CONFIDENTIALITY: never commit non-public data
 input_data/
