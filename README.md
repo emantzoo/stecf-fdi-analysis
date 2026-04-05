@@ -1,5 +1,8 @@
 # EU FDI Explorer
 
+![EU FDI Explorer](https://raw.githubusercontent.com/emantzoo/emantzoo.github.io/master/images/eu-fdi-explorer.jpg)
+
+
 **Fishing Effort, Landings, Discards & Fleet Adaptation across European Sea Basins (2013–2024)**
 
 An interactive R Markdown analysis of the EU Fisheries Dependent Information (FDI) dataset — the most comprehensive publicly available record of European fishing activity. Built as a self-contained HTML report with drill-down charts, linked filters, and a data playground for self-service exploration.
